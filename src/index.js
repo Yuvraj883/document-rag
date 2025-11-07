@@ -9,8 +9,7 @@ import { OpenAIEmbeddings } from '@langchain/openai'
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai'
 import { PromptTemplate } from '@langchain/core/prompts'
 // import { formatDocumentsAsString } from '@langchain/core/documents'
-import { GoogleGenerativeAI } from "@google/generative-ai";
-
+import { GoogleGenerativeAI } from '@google/generative-ai'
 
 const app = express()
 app.use(express.json())
@@ -108,6 +107,10 @@ app.post('/ask', async (req, res) => {
     console.error('❌ Error handling question:', error)
     res.status(500).json({ error: 'Failed to get an answer.' })
   }
+})
+
+app.get('/', (req, res) => {
+  res.send('Welcome to the RAG Chatbot API!')
 })
 
 initializeChatbot().then(() => {
