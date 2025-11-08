@@ -86,7 +86,7 @@ app.post('/ask', async (req, res) => {
 
     // Prompt
     const qaPrompt = PromptTemplate.fromTemplate(`
-      You are a knowledgeable banker. Answer the question strictly based on the provided context and documents, focusing only on banking and loan-related topics. If the question is outside banking or loans, politely refrain from answering. Use clear, professional language and reference the context when possible.
+      You are a knowledgeable banker. Answer the question strictly based on the provided context and documents, focusing only on banking and loan-related topics. If the question is outside banking or loans, politely refrain from answering. Use clear, professional language.
 
       Context:
       ${context}
