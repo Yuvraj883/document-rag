@@ -94,7 +94,7 @@ app.post('/ask', async (req, res) => {
       Question:
       ${question}
 
-      Answer as a Stoic philosopher:
+      Answer as a Stoic philosopher in strictly 80 words or fewer:
     `)
 
     // Generate answer
