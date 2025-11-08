@@ -101,7 +101,7 @@ app.post('/ask', async (req, res) => {
     const prompt = await qaPrompt.format({ context, question })
     const result = await llm.invoke(prompt)
 
-    res.json({ answer: result.content })
+    res.json({ answer: result.content, context })
   } catch (error) {
     console.error('❌ Error handling question:', error)
     res.status(500).json({ error: 'Failed to get an answer.' })
