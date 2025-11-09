@@ -30,7 +30,7 @@ const __dirname = path.dirname(__filename)
 // -----------------------------
 // 🚀 Main Ingestion Function
 // -----------------------------
-const ingestDocuments = async () => {
+export async function ingestDocuments(namespace = 'default') {
   try {
     console.log('🔄 Initializing Pinecone client...')
     const client = new Pinecone({
@@ -76,13 +76,18 @@ const ingestDocuments = async () => {
     console.log('🚀 Uploading embeddings to Pinecone...')
     await PineconeStore.fromDocuments(docs, embeddings, {
       pineconeIndex,
-      namespace: 'your-namespace',
+      namespace,
     })
 
     console.log('🎉 Documents successfully ingested into Pinecone!')
+    return {
+      success: true,
+      message: 'Documents ingested successfully',
+      chunks: docs.length,
+      docs: rawDocs.length,
+    }
   } catch (error) {
     console.error('❌ Error ingesting documents:', error)
+    return { success: false, error: error.message }
   }
 }
-
-ingestDocuments()

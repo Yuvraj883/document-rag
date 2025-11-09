@@ -2,6 +2,10 @@
 import 'dotenv/config'
 import express from 'express'
 import { Pinecone } from '@pinecone-database/pinecone'
+import multer from 'multer'
+import fs from 'fs'
+import path from 'path'
+import { ingestDocuments } from './ingest.js'
 
 // LangChain imports
 import { PineconeStore } from '@langchain/pinecone'
@@ -16,11 +20,14 @@ app.use(express.json())
 
 const PORT = process.env.PORT || 3000
 
-let vectorStore
 let llm
 
 const formatDocumentsAsString = (docs) =>
   docs.map((doc) => doc.pageContent).join('\n\n')
+
+const documentsDir = path.join(process.cwd(), 'documents')
+const archiveDir = path.join(process.cwd(), 'archive')
+const upload = multer({ dest: documentsDir })
 
 // -----------------------------
 // 🚀 Initialize Chatbot
@@ -39,12 +46,6 @@ async function initializeChatbot() {
       modelName: 'text-embedding-3-small',
       openAIApiKey: process.env.OPENAI_API_KEY,
       dimensions: 512,
-    })
-
-    // Vector store
-    vectorStore = await PineconeStore.fromExistingIndex(embeddings, {
-      pineconeIndex,
-      namespace: 'your-namespace',
     })
 
     // Gemini LLM
@@ -66,17 +67,30 @@ async function initializeChatbot() {
 // 💬 Handle User Query
 // -----------------------------
 app.post('/ask', async (req, res) => {
-  const { question } = req.body
+  const { question, namespace } = req.body
 
   if (!question) return res.status(400).json({ error: 'Question is required.' })
 
-  if (!vectorStore || !llm)
+  if (!llm)
     return res.status(503).json({ error: 'Chatbot still initializing.' })
 
   console.log(`🧠 Received question: ${question}`)
 
   try {
-    // Retrieve relevant docs
+    // Create a new Pinecone client and index for each request
+    const client = new Pinecone({
+      apiKey: process.env.PINECONE_API_KEY,
+    })
+    const pineconeIndex = client.index('rag-project')
+    const embeddings = new OpenAIEmbeddings({
+      modelName: 'text-embedding-3-small',
+      openAIApiKey: process.env.OPENAI_API_KEY,
+      dimensions: 512,
+    })
+    const vectorStore = await PineconeStore.fromExistingIndex(embeddings, {
+      pineconeIndex,
+      namespace,
+    })
     const retriever = vectorStore.asRetriever({ k: 4 })
     const relevantDocs = await retriever.getRelevantDocuments(question)
     console.log(`📄 Retrieved ${relevantDocs.length} documents.`)
@@ -86,7 +100,7 @@ app.post('/ask', async (req, res) => {
 
     // Prompt
     const qaPrompt = PromptTemplate.fromTemplate(`
-      You are a knowledgeable banker. Answer the question strictly based on the provided context and documents, focusing only on banking and loan-related topics. If the question is outside banking or loans, politely refrain from answering. Use clear, professional language.
+      You are a helpful and knowledgeable assistant. Treat the provided context as your own personal knowledge. Answer the question strictly based on the context, but do not reference images, figures, or visual content. If the context mentions images or figures, politely state that you cannot display them in this chat. Never mention or reference the documents or say 'the provided document' or 'the provided text'. Use clear, accurate, and concise language. If the context does not contain enough information to answer, simply say: "I don't know about that currently."
 
       Context:
       ${context}
@@ -94,7 +108,7 @@ app.post('/ask', async (req, res) => {
       Question:
       ${question}
 
-      Answer as a banker (do not answer if unrelated to banking or loans):
+      Answer:
     `)
 
     // Generate answer
@@ -105,6 +119,42 @@ app.post('/ask', async (req, res) => {
   } catch (error) {
     console.error('❌ Error handling question:', error)
     res.status(500).json({ error: 'Failed to get an answer.' })
+  }
+})
+
+app.post('/ingest', upload.single('file'), async (req, res) => {
+  try {
+    // Move only .pdf and .txt files in documents/ to archive/
+    fs.readdirSync(documentsDir).forEach((file) => {
+      if (file.endsWith('.pdf') || file.endsWith('.txt')) {
+        const oldPath = path.join(documentsDir, file)
+        const archivePath = path.join(archiveDir, file)
+        if (fs.existsSync(oldPath)) {
+          fs.renameSync(oldPath, archivePath)
+        }
+      }
+    })
+
+    // Move uploaded file to documents/ with original name
+    const uploadedFile = req.file
+    const ext = path.extname(uploadedFile.originalname)
+    const newPath = path.join(documentsDir, uploadedFile.originalname)
+    fs.renameSync(uploadedFile.path, newPath)
+
+    // Get metadata from request
+    const { organisation, website, namespace } = req.body
+
+    // Optionally, save metadata to a file for reference
+    // fs.writeFileSync(
+    //   path.join(documentsDir, 'metadata.json'),
+    //   JSON.stringify({ organisation, website, namespace }, null, 2)
+    // )
+
+    // Run ingestion with namespace
+    const result = await ingestDocuments(namespace)
+    res.json({ ...result, organisation, website, namespace })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
   }
 })
 
