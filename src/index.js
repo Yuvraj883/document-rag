@@ -14,10 +14,11 @@ import { ChatGoogleGenerativeAI } from '@langchain/google-genai'
 import { PromptTemplate } from '@langchain/core/prompts'
 // import { formatDocumentsAsString } from '@langchain/core/documents'
 import { GoogleGenerativeAI } from '@google/generative-ai'
+import cors from 'cors'
 
 const app = express()
 app.use(express.json())
-
+app.use(cors({ origin: '*' }))
 const PORT = process.env.PORT || 3000
 
 let llm
