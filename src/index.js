@@ -5,7 +5,7 @@ import { Pinecone } from '@pinecone-database/pinecone'
 import multer from 'multer'
 import fs from 'fs'
 import path from 'path'
-import { ingestDocuments } from './ingest.js'
+import { ingestDocuments, ingestWebsite } from './ingest.js'
 
 // LangChain imports
 import { PineconeStore } from '@langchain/pinecone'
@@ -29,6 +29,18 @@ const formatDocumentsAsString = (docs) =>
 const documentsDir = path.join(process.cwd(), 'documents')
 const archiveDir = path.join(process.cwd(), 'archive')
 const upload = multer({ dest: documentsDir })
+
+const deriveNamespace = (namespaceValue, organisation) => {
+  if (namespaceValue && namespaceValue.trim()) return namespaceValue.trim()
+  if (organisation && organisation.trim()) {
+    const slug = organisation
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+    if (slug) return slug
+  }
+  return 'default'
+}
 
 // -----------------------------
 // 🚀 Initialize Chatbot
@@ -123,27 +135,45 @@ app.post('/ask', async (req, res) => {
   }
 })
 
+const moveUploadedFile = (uploadedFile) => {
+  if (!uploadedFile) return null
+  const newPath = path.join(documentsDir, uploadedFile.originalname)
+  fs.renameSync(uploadedFile.path, newPath)
+  return newPath
+}
+
+const archiveExistingDocuments = () => {
+  fs.readdirSync(documentsDir).forEach((file) => {
+    if (file.endsWith('.pdf') || file.endsWith('.txt')) {
+      const oldPath = path.join(documentsDir, file)
+      const archivePath = path.join(archiveDir, file)
+      if (fs.existsSync(oldPath)) {
+        fs.renameSync(oldPath, archivePath)
+      }
+    }
+  })
+}
+
+const ensureUploadDirectories = () => {
+  if (!fs.existsSync(documentsDir)) fs.mkdirSync(documentsDir, { recursive: true })
+  if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true })
+}
+
 app.post('/ingest', upload.single('file'), async (req, res) => {
   try {
-    // Move only .pdf and .txt files in documents/ to archive/
-    fs.readdirSync(documentsDir).forEach((file) => {
-      if (file.endsWith('.pdf') || file.endsWith('.txt')) {
-        const oldPath = path.join(documentsDir, file)
-        const archivePath = path.join(archiveDir, file)
-        if (fs.existsSync(oldPath)) {
-          fs.renameSync(oldPath, archivePath)
-        }
-      }
-    })
+    ensureUploadDirectories()
 
     // Move uploaded file to documents/ with original name
     const uploadedFile = req.file
-    const ext = path.extname(uploadedFile.originalname)
-    const newPath = path.join(documentsDir, uploadedFile.originalname)
-    fs.renameSync(uploadedFile.path, newPath)
+    if (uploadedFile) {
+      archiveExistingDocuments()
+      moveUploadedFile(uploadedFile)
+    }
 
     // Get metadata from request
-    const { organisation, website, namespace } = req.body
+  const { organisation, website, namespace, url } = req.body
+    const targetNamespace = deriveNamespace(namespace, organisation)
+  const crawlTargetUrl = url?.trim() || website?.trim()
 
     // Optionally, save metadata to a file for reference
     // fs.writeFileSync(
@@ -151,9 +181,48 @@ app.post('/ingest', upload.single('file'), async (req, res) => {
     //   JSON.stringify({ organisation, website, namespace }, null, 2)
     // )
 
-    // Run ingestion with namespace
-    const result = await ingestDocuments(namespace)
-    res.json({ ...result, organisation, website, namespace })
+  if (!uploadedFile && !crawlTargetUrl) {
+      return res.status(400).json({
+        success: false,
+      error: 'Provide at least a document file upload or a website URL to ingest.',
+      })
+    }
+
+  const responsePayload = {
+      success: true,
+      organisation,
+      website,
+    url: crawlTargetUrl,
+      namespace: targetNamespace,
+    }
+
+    if (uploadedFile) {
+      const documentResult = await ingestDocuments(targetNamespace)
+      responsePayload.documentIngestion = documentResult
+      if (!documentResult.success) {
+        return res.status(500).json({
+          success: false,
+          error: documentResult.error || 'Failed to ingest document.',
+        })
+      }
+    }
+
+  if (crawlTargetUrl) {
+      const websiteResult = await ingestWebsite({
+      url: crawlTargetUrl,
+        organisation,
+        namespace: targetNamespace,
+      })
+      responsePayload.websiteIngestion = websiteResult
+      if (!websiteResult.success) {
+        return res.status(500).json({
+          success: false,
+          error: websiteResult.error || 'Failed to ingest website.',
+        })
+      }
+    }
+
+    res.json(responsePayload)
   } catch (error) {
     res.status(500).json({ success: false, error: error.message })
   }
