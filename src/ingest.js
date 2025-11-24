@@ -3,26 +3,35 @@
 import 'dotenv/config'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { createRequire } from 'module'
+
+// pdf-parse is a CommonJS module - use createRequire for better compatibility
+const require = createRequire(import.meta.url)
+const pdfParse = require('pdf-parse')
 
 // -----------------------------
 // ✅ LangChain Core Imports
 // -----------------------------
-import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters'
-import { OpenAIEmbeddings } from '@langchain/openai'
 import { PineconeStore } from '@langchain/pinecone'
-import { Document } from '@langchain/core/documents'
-import { load as loadHtml } from 'cheerio'
-import { XMLParser } from 'fast-xml-parser'
 
 // ✅ FIXED Loader Imports for @langchain/community@0.2.9
 import { DirectoryLoader } from 'langchain/document_loaders/fs/directory'
 import { TextLoader } from 'langchain/document_loaders/fs/text'
 import { PDFLoader } from 'langchain/document_loaders/fs/pdf'
+import { Document } from '@langchain/core/documents'
 
 // -----------------------------
-// ✅ Pinecone Client (v2 SDK)
+// ✅ Utils Imports
 // -----------------------------
-import { Pinecone } from '@pinecone-database/pinecone'
+import { createTextSplitter, createEmbeddings, getPineconeIndex } from './utils/pinecone.js'
+import { toAbsoluteUrl } from './utils/text.js'
+import {
+  parseHtmlToDocument,
+  collectWebsitePages,
+  MIN_WEBSITE_LENGTH,
+  MAX_WEBSITE_PAGES,
+} from './utils/website.js'
+import { uploadToCloudStorage } from './utils/storage.js'
 
 // -----------------------------
 // ✅ Path Setup
@@ -30,69 +39,101 @@ import { Pinecone } from '@pinecone-database/pinecone'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-// -----------------------------
-// 🚀 Main Ingestion Function
-// -----------------------------
-const PINECONE_INDEX_NAME = 'rag-project'
-const splitterConfig = { chunkSize: 1000, chunkOverlap: 200 }
-const MIN_WEBSITE_LENGTH = 200
-const MAX_WEBSITE_PAGES = Number(process.env.MAX_WEBSITE_PAGES || 20)
-const MAX_LINKS_PER_PAGE = Number(process.env.MAX_LINKS_PER_PAGE || 50)
-const crawlerUserAgent = 'document-rag-bot/1.0 (+https://github.com/)'
-const xmlParser = new XMLParser({ ignoreAttributes: false })
-
-const createTextSplitter = () => new RecursiveCharacterTextSplitter(splitterConfig)
-
-const createEmbeddings = () =>
-  new OpenAIEmbeddings({
-    modelName: 'text-embedding-3-small',
-    apiKey: process.env.OPENAI_API_KEY,
-    dimensions: 512,
-  })
-
-const getPineconeIndex = () => {
-  console.log('🔄 Initializing Pinecone client...')
-  const client = new Pinecone({
-    apiKey: process.env.PINECONE_API_KEY,
-  })
-
-  return client.index(PINECONE_INDEX_NAME)
-}
-
-const normalizeWhitespace = (text = '') => text.replace(/\s+/g, ' ').trim()
-
-const parseHtmlToDocument = (html, url, organisation) => {
-  const $ = loadHtml(html)
-  $('script, style, noscript, iframe, svg').remove()
-  const title = normalizeWhitespace($('title').first().text()) || url
-  const bodyText = normalizeWhitespace($('body').text())
-
-  return {
-    title,
-    bodyText,
-    document: new Document({
-      pageContent: bodyText,
-      metadata: {
-        source: url,
-        organisation: organisation || 'unknown',
-        title,
-        scrapedAt: new Date().toISOString(),
-      },
-    }),
-  }
-}
-
-const toAbsoluteUrl = (value) => {
-  if (!value) return null
+/**
+ * Process and ingest a document from a memory buffer
+ * This works in production/serverless environments where filesystem is ephemeral
+ */
+export async function ingestDocumentFromBuffer({
+  buffer,
+  filename,
+  mimetype,
+  namespace = 'default',
+}) {
   try {
-    const trimmed = value.trim()
-    if (!trimmed) return null
-    if (!/^https?:\/\//i.test(trimmed)) {
-      return new URL(`https://${trimmed}`).href
+    console.log(`📄 Processing file from memory: ${filename}`)
+
+    let rawDocs = []
+
+    // Process PDF files
+    if (mimetype === 'application/pdf' || filename.toLowerCase().endsWith('.pdf')) {
+      const pdfData = await pdfParse(buffer)
+      rawDocs = [
+        new Document({
+          pageContent: pdfData.text,
+          metadata: {
+            source: filename,
+            pdfInfo: pdfData.info,
+            totalPages: pdfData.numpages,
+          },
+        }),
+      ]
     }
-    return new URL(trimmed).href
-  } catch {
-    return null
+    // Process text files
+    else if (
+      mimetype?.startsWith('text/') ||
+      filename.toLowerCase().endsWith('.txt')
+    ) {
+      const text = buffer.toString('utf-8')
+      rawDocs = [
+        new Document({
+          pageContent: text,
+          metadata: { source: filename },
+        }),
+      ]
+    } else {
+      // Try to parse as text if unknown type
+      try {
+        const text = buffer.toString('utf-8')
+        rawDocs = [
+          new Document({
+            pageContent: text,
+            metadata: { source: filename },
+          }),
+        ]
+      } catch (error) {
+        throw new Error(
+          `Unsupported file type: ${mimetype || 'unknown'}. Supported types: PDF, TXT`
+        )
+      }
+    }
+
+    console.log(`✅ Loaded ${rawDocs.length} document(s) from buffer.`)
+
+    // Split text
+    const textSplitter = createTextSplitter()
+    const docs = await textSplitter.splitDocuments(rawDocs)
+    console.log(`✅ Split into ${docs.length} chunks.`)
+
+    // Embeddings + Pinecone
+    const embeddings = createEmbeddings()
+    const pineconeIndex = getPineconeIndex()
+
+    // Store in Pinecone
+    console.log('🚀 Uploading embeddings to Pinecone...')
+    await PineconeStore.fromDocuments(docs, embeddings, {
+      pineconeIndex,
+      namespace,
+    })
+
+    // Optionally upload original file to cloud storage
+    let storageResult = null
+    if (process.env.STORAGE_PROVIDER && process.env.STORAGE_PROVIDER !== 'none') {
+      console.log('☁️ Uploading original file to cloud storage...')
+      storageResult = await uploadToCloudStorage(buffer, filename, namespace)
+    }
+
+    console.log('🎉 Document successfully ingested into Pinecone!')
+    return {
+      success: true,
+      message: 'Document ingested successfully',
+      chunks: docs.length,
+      docs: rawDocs.length,
+      filename,
+      storage: storageResult,
+    }
+  } catch (error) {
+    console.error('❌ Error ingesting document from buffer:', error)
+    return { success: false, error: error.message }
   }
 }
 
@@ -144,132 +185,6 @@ export async function ingestDocuments(namespace = 'default') {
   }
 }
 
-async function fetchWebsiteContent(url) {
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': crawlerUserAgent,
-      Accept: 'text/html,application/xhtml+xml',
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`)
-  }
-
-  return response.text()
-}
-
-const extractLinks = (html, baseUrl, baseHost) => {
-  const $ = loadHtml(html)
-  const links = new Set()
-  $('a[href]').each((_, el) => {
-    const href = $(el).attr('href')
-    if (!href) return
-    try {
-      const resolved = new URL(href, baseUrl)
-      if (!['http:', 'https:'].includes(resolved.protocol)) return
-      if (resolved.hostname !== baseHost) return
-      resolved.hash = ''
-      links.add(resolved.href)
-    } catch {
-      // ignore invalid URLs
-    }
-  })
-  return Array.from(links).slice(0, MAX_LINKS_PER_PAGE)
-}
-
-const fetchSitemapUrls = async (startUrl, limit = MAX_WEBSITE_PAGES) => {
-  try {
-    const base = new URL(startUrl)
-    const sitemapUrl = new URL('/sitemap.xml', `${base.origin}/`).href
-    console.log(`🗺️ Checking sitemap at ${sitemapUrl}`)
-    const response = await fetch(sitemapUrl, {
-      headers: {
-        'User-Agent': crawlerUserAgent,
-        Accept: 'application/xml,text/xml;q=0.9,*/*;q=0.8',
-      },
-    })
-
-    if (!response.ok) {
-      return []
-    }
-
-    const xml = await response.text()
-    const parsed = xmlParser.parse(xml)
-    const urls = []
-
-    const urlset = parsed.urlset?.url
-    if (urlset) {
-      const entries = Array.isArray(urlset) ? urlset : [urlset]
-      entries.forEach((entry) => {
-        if (entry.loc) urls.push(entry.loc)
-      })
-    }
-
-    return urls.slice(0, limit)
-  } catch (error) {
-    console.warn(`⚠️ Unable to parse sitemap for ${startUrl}: ${error.message}`)
-    return []
-  }
-}
-
-const downloadPagesSequentially = async (urls, limit = MAX_WEBSITE_PAGES) => {
-  const pages = []
-  for (const url of urls.slice(0, limit)) {
-    try {
-      console.log(`🌐 Fetching ${url}`)
-      const html = await fetchWebsiteContent(url)
-      pages.push({ url, html })
-    } catch (error) {
-      console.warn(`⚠️ Failed to fetch ${url}: ${error.message}`)
-    }
-  }
-  return pages
-}
-
-const crawlWebsite = async (startUrl, limit = MAX_WEBSITE_PAGES) => {
-  const queue = [startUrl]
-  const seen = new Set()
-  const pages = []
-  const baseHost = new URL(startUrl).hostname
-
-  while (queue.length && pages.length < limit) {
-    const current = queue.shift()
-    if (!current || seen.has(current)) continue
-    seen.add(current)
-
-    try {
-      console.log(`🔎 Crawling ${current}`)
-      const html = await fetchWebsiteContent(current)
-      pages.push({ url: current, html })
-
-      if (pages.length >= limit) break
-
-      const links = extractLinks(html, current, baseHost)
-      links.forEach((link) => {
-        if (!seen.has(link) && queue.length + pages.length < limit * 2) {
-          queue.push(link)
-        }
-      })
-    } catch (error) {
-      console.warn(`⚠️ Failed to crawl ${current}: ${error.message}`)
-    }
-  }
-
-  return pages
-}
-
-const collectWebsitePages = async (url, limit = MAX_WEBSITE_PAGES) => {
-  const sitemapUrls = await fetchSitemapUrls(url, limit)
-  if (sitemapUrls.length) {
-    const normalized = sitemapUrls.includes(url) ? sitemapUrls : [url, ...sitemapUrls]
-    console.log(`🧭 Sitemap found with ${normalized.length} URLs.`)
-    return downloadPagesSequentially(normalized, limit)
-  }
-
-  console.log('🧭 No sitemap found, falling back to crawl.')
-  return crawlWebsite(url, limit)
-}
 
 export async function ingestWebsite({
   url,

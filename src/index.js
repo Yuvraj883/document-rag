@@ -3,44 +3,41 @@ import 'dotenv/config'
 import express from 'express'
 import { Pinecone } from '@pinecone-database/pinecone'
 import multer from 'multer'
-import fs from 'fs'
-import path from 'path'
-import { ingestDocuments, ingestWebsite } from './ingest.js'
+import { ingestDocuments, ingestWebsite, ingestDocumentFromBuffer } from './ingest.js'
 
 // LangChain imports
 import { PineconeStore } from '@langchain/pinecone'
 import { OpenAIEmbeddings } from '@langchain/openai'
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai'
 import { PromptTemplate } from '@langchain/core/prompts'
-// import { formatDocumentsAsString } from '@langchain/core/documents'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import cors from 'cors'
+
+// Utils imports
+import { formatDocumentsAsString } from './utils/text.js'
+import { deriveNamespace } from './utils/namespace.js'
 
 const app = express()
 app.use(express.json())
 app.use(cors({ origin: '*' }))
 const PORT = process.env.PORT || 3000
 
-let llm
+// Use memory storage for production (works in serverless environments)
+const storage = multer.memoryStorage()
 
-const formatDocumentsAsString = (docs) =>
-  docs.map((doc) => doc.pageContent).join('\n\n')
+// Configurable file size limit (default: 50MB, can be set via MAX_FILE_SIZE env var in bytes)
+const maxFileSize = process.env.MAX_FILE_SIZE 
+  ? parseInt(process.env.MAX_FILE_SIZE, 10) 
+  : 50 * 1024 * 1024 // 50MB default
 
-const documentsDir = path.join(process.cwd(), 'documents')
-const archiveDir = path.join(process.cwd(), 'archive')
-const upload = multer({ dest: documentsDir })
-
-const deriveNamespace = (namespaceValue, organisation) => {
-  if (namespaceValue && namespaceValue.trim()) return namespaceValue.trim()
-  if (organisation && organisation.trim()) {
-    const slug = organisation
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-    if (slug) return slug
+const upload = multer({ 
+  storage,
+  limits: {
+    fileSize: maxFileSize,
   }
-  return 'default'
-}
+})
+
+let llm
 
 // -----------------------------
 // 🚀 Initialize Chatbot
@@ -79,6 +76,9 @@ async function initializeChatbot() {
 // -----------------------------
 // 💬 Handle User Query
 // -----------------------------
+
+let msgHistory = [];
+
 app.post('/ask', async (req, res) => {
   const { question, namespace } = req.body
 
@@ -111,93 +111,69 @@ app.post('/ask', async (req, res) => {
     // Format docs
     const context = formatDocumentsAsString(relevantDocs)
 
+
     // Prompt
     const qaPrompt = PromptTemplate.fromTemplate(`
       You are a helpful and knowledgeable assistant. Treat the provided context as your own personal knowledge. Answer the question strictly based on the context, but do not reference images, figures, or visual content. If the context mentions images or figures, politely state that you cannot display them in this chat. Never mention or reference the documents or say 'the provided document' or 'the provided text'. Use clear, accurate, and concise language. If the context does not contain enough information to answer, simply say: "I don't know about that currently."
 
-      Context:
-      ${context}
+     Chat History:
+     ${msgHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n')}
 
       Question:
       ${question}
 
+      Retrieval Context:
+      ${context}
+
+
       Answer:
     `)
+    
+    msgHistory.push({ role: 'user', content: question })
 
     // Generate answer
     const prompt = await qaPrompt.format({ context, question })
     const result = await llm.invoke(prompt)
-
-    res.json({ answer: result.content, context })
+    msgHistory.push({ role: 'assistant', content: result.content })
+    console.log(msgHistory)
+    res.json({ answer: result.content })
   } catch (error) {
     console.error('❌ Error handling question:', error)
     res.status(500).json({ error: 'Failed to get an answer.' })
   }
 })
 
-const moveUploadedFile = (uploadedFile) => {
-  if (!uploadedFile) return null
-  const newPath = path.join(documentsDir, uploadedFile.originalname)
-  fs.renameSync(uploadedFile.path, newPath)
-  return newPath
-}
-
-const archiveExistingDocuments = () => {
-  fs.readdirSync(documentsDir).forEach((file) => {
-    if (file.endsWith('.pdf') || file.endsWith('.txt')) {
-      const oldPath = path.join(documentsDir, file)
-      const archivePath = path.join(archiveDir, file)
-      if (fs.existsSync(oldPath)) {
-        fs.renameSync(oldPath, archivePath)
-      }
-    }
-  })
-}
-
-const ensureUploadDirectories = () => {
-  if (!fs.existsSync(documentsDir)) fs.mkdirSync(documentsDir, { recursive: true })
-  if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true })
-}
-
 app.post('/ingest', upload.single('file'), async (req, res) => {
   try {
-    ensureUploadDirectories()
-
-    // Move uploaded file to documents/ with original name
-    const uploadedFile = req.file
-    if (uploadedFile) {
-      archiveExistingDocuments()
-      moveUploadedFile(uploadedFile)
-    }
-
     // Get metadata from request
-  const { organisation, website, namespace, url } = req.body
+    const { organisation, website, namespace, url } = req.body
     const targetNamespace = deriveNamespace(namespace, organisation)
-  const crawlTargetUrl = url?.trim() || website?.trim()
+    const crawlTargetUrl = url?.trim() || website?.trim()
+    const uploadedFile = req.file
 
-    // Optionally, save metadata to a file for reference
-    // fs.writeFileSync(
-    //   path.join(documentsDir, 'metadata.json'),
-    //   JSON.stringify({ organisation, website, namespace }, null, 2)
-    // )
-
-  if (!uploadedFile && !crawlTargetUrl) {
+    if (!uploadedFile && !crawlTargetUrl) {
       return res.status(400).json({
         success: false,
-      error: 'Provide at least a document file upload or a website URL to ingest.',
+        error: 'Provide at least a document file upload or a website URL to ingest.',
       })
     }
 
-  const responsePayload = {
+    const responsePayload = {
       success: true,
       organisation,
       website,
-    url: crawlTargetUrl,
+      url: crawlTargetUrl,
       namespace: targetNamespace,
     }
 
+    // Process file from memory buffer (works in production/serverless)
     if (uploadedFile) {
-      const documentResult = await ingestDocuments(targetNamespace)
+      const documentResult = await ingestDocumentFromBuffer({
+        buffer: uploadedFile.buffer,
+        filename: uploadedFile.originalname,
+        mimetype: uploadedFile.mimetype,
+        namespace: targetNamespace,
+      })
       responsePayload.documentIngestion = documentResult
       if (!documentResult.success) {
         return res.status(500).json({
@@ -207,9 +183,10 @@ app.post('/ingest', upload.single('file'), async (req, res) => {
       }
     }
 
-  if (crawlTargetUrl) {
+    // Process website if URL provided
+    if (crawlTargetUrl) {
       const websiteResult = await ingestWebsite({
-      url: crawlTargetUrl,
+        url: crawlTargetUrl,
         organisation,
         namespace: targetNamespace,
       })
@@ -224,8 +201,44 @@ app.post('/ingest', upload.single('file'), async (req, res) => {
 
     res.json(responsePayload)
   } catch (error) {
+    // Handle multer errors specifically
+    if (error instanceof multer.MulterError) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        const maxSizeMB = Math.round(maxFileSize / (1024 * 1024))
+        return res.status(400).json({
+          success: false,
+          error: `File too large. Maximum file size is ${maxSizeMB}MB.`,
+          maxFileSize: maxFileSize,
+          maxFileSizeMB: maxSizeMB,
+        })
+      }
+      return res.status(400).json({
+        success: false,
+        error: `Upload error: ${error.message}`,
+      })
+    }
     res.status(500).json({ success: false, error: error.message })
   }
+})
+
+// Global error handler for multer errors that occur before route handler
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      const maxSizeMB = Math.round(maxFileSize / (1024 * 1024))
+      return res.status(400).json({
+        success: false,
+        error: `File too large. Maximum file size is ${maxSizeMB}MB.`,
+        maxFileSize: maxFileSize,
+        maxFileSizeMB: maxSizeMB,
+      })
+    }
+    return res.status(400).json({
+      success: false,
+      error: `Upload error: ${error.message}`,
+    })
+  }
+  next(error)
 })
 
 app.get('/', (req, res) => {
